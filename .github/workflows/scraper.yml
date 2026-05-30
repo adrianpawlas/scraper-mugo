@@ -5,7 +5,17 @@ on:
     # Tuesday and Friday at 4:30 AM UTC
     - cron: "30 4 * * 2,5"
   workflow_dispatch:
-    # Allows manual trigger from GitHub Actions UI
+    inputs:
+      skip_model_download:
+        description: 'Skip pre-downloading embedding model'
+        required: false
+        default: false
+        type: boolean
+      skip_scrape:
+        description: 'Skip the scraping step (for testing/debugging)'
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: scraper-mugo
@@ -43,21 +53,23 @@ jobs:
           key: huggingface-models-${{ runner.os }}-siglip-v2
 
       - name: Pre-download embedding model (verify cache integrity)
+        if: ${{ inputs.skip_model_download != 'true' }}
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_HUB_DISABLE_SYMLINKS: "1"
         run: |
           python -c "
-from huggingface_hub import snapshot_download
-import os
-cache = os.path.expanduser('~/.cache/scraper-mugo')
-os.makedirs(cache, exist_ok=True)
-print('Downloading google/siglip-base-patch16-384...')
-snapshot_download('google/siglip-base-patch16-384', cache_dir=cache)
-print('Model downloaded successfully')
-"
+          from huggingface_hub import snapshot_download
+          import os
+          cache = os.path.expanduser('~/.cache/scraper-mugo')
+          os.makedirs(cache, exist_ok=True)
+          print('Downloading google/siglip-base-patch16-384...')
+          snapshot_download('google/siglip-base-patch16-384', cache_dir=cache)
+          print('Model downloaded successfully')
+          "
 
       - name: Run scraper
+        if: ${{ inputs.skip_scrape != 'true' }}
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
