@@ -1,4 +1,4 @@
-name: Scrape Mugo Department
+name: Mugo Department Scraper
 
 on:
   schedule:
