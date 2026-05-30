@@ -39,8 +39,23 @@ jobs:
       - name: Cache HuggingFace models
         uses: actions/cache@v4
         with:
-          path: ~/.cache/huggingface
-          key: huggingface-models-${{ runner.os }}-siglip
+          path: ~/.cache/scraper-mugo
+          key: huggingface-models-${{ runner.os }}-siglip-v2
+
+      - name: Pre-download embedding model (verify cache integrity)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HUB_DISABLE_SYMLINKS: "1"
+        run: |
+          python -c "
+from huggingface_hub import snapshot_download
+import os
+cache = os.path.expanduser('~/.cache/scraper-mugo')
+os.makedirs(cache, exist_ok=True)
+print('Downloading google/siglip-base-patch16-384...')
+snapshot_download('google/siglip-base-patch16-384', cache_dir=cache)
+print('Model downloaded successfully')
+"
 
       - name: Run scraper
         env:
@@ -48,6 +63,7 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           CACHE_DIR: ~/.cache/scraper-mugo
+          HF_HUB_DISABLE_SYMLINKS: "1"
         run: |
           mkdir -p ~/.cache/scraper-mugo
           python -m src.main

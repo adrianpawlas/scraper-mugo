@@ -5,6 +5,8 @@ Supports both image and text embeddings with the same model.
 
 import io
 import logging
+import os
+import shutil
 from typing import Optional
 
 import requests
@@ -28,22 +30,52 @@ _processor: Optional[ProcessorMixin] = None
 
 
 def _load_model() -> tuple[PreTrainedModel, ProcessorMixin]:
-    """Load the SigLIP model and processor once (lazy singleton)."""
+    """Load the SigLIP model and processor once (lazy singleton).
+
+    If loading fails (e.g. corrupted HuggingFace cache with broken
+    symlinks), the cache directory is cleared and a fresh download is
+    attempted once before giving up.
+    """
     global _model, _processor
     if _model is None or _processor is None:
         logger.info("Loading embedding model: %s ...", EMBEDDING_MODEL)
-        _model = AutoModel.from_pretrained(
-            EMBEDDING_MODEL,
-            cache_dir=CACHE_DIR,
-            trust_remote_code=True,
-        )
-        _processor = AutoProcessor.from_pretrained(
-            EMBEDDING_MODEL,
-            cache_dir=CACHE_DIR,
-            trust_remote_code=True,
-        )
-        _model.eval()
-        logger.info("Model loaded successfully.")
+        try:
+            _model = AutoModel.from_pretrained(
+                EMBEDDING_MODEL,
+                cache_dir=CACHE_DIR,
+                trust_remote_code=True,
+            )
+            _processor = AutoProcessor.from_pretrained(
+                EMBEDDING_MODEL,
+                cache_dir=CACHE_DIR,
+                trust_remote_code=True,
+            )
+            _model.eval()
+            logger.info("Model loaded successfully.")
+        except Exception as exc:
+            logger.warning(
+                "Failed to load model from cache: %s. Clearing cache and retrying...", exc
+            )
+            # Corrupted HF cache (e.g. broken symlinks) — clear and retry
+            model_cache_path = os.path.join(
+                CACHE_DIR,
+                f"models--{EMBEDDING_MODEL.replace('/', '--')}",
+            )
+            if os.path.isdir(model_cache_path):
+                shutil.rmtree(model_cache_path, ignore_errors=True)
+                logger.info("Cleared cached model at %s", model_cache_path)
+            _model = AutoModel.from_pretrained(
+                EMBEDDING_MODEL,
+                cache_dir=CACHE_DIR,
+                trust_remote_code=True,
+            )
+            _processor = AutoProcessor.from_pretrained(
+                EMBEDDING_MODEL,
+                cache_dir=CACHE_DIR,
+                trust_remote_code=True,
+            )
+            _model.eval()
+            logger.info("Model loaded successfully after cache clear.")
     return _model, _processor
 
 
