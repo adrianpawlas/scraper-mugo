@@ -1,0 +1,17 @@
+# Core
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# Embeddings
+torch>=2.0.0
+transformers>=4.40.0
+Pillow>=10.0.0
+
+# Supabase
+supabase>=2.0.0
+
+# Image downloading
+urllib3>=2.0.0
+
+# Progress bar
+tqdm>=4.66.0

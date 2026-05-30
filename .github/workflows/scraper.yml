@@ -1,0 +1,53 @@
+name: Scrape Mugo Department
+
+on:
+  schedule:
+    # Tuesday and Friday at 4:30 AM UTC
+    - cron: "30 4 * * 2,5"
+  workflow_dispatch:
+    # Allows manual trigger from GitHub Actions UI
+
+concurrency:
+  group: scraper-mugo
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    name: Run Mugo Scraper
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install PyTorch (CPU-only)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install other dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Cache HuggingFace models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: huggingface-models-${{ runner.os }}-siglip
+
+      - name: Run scraper
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          CACHE_DIR: ~/.cache/scraper-mugo
+        run: |
+          mkdir -p ~/.cache/scraper-mugo
+          python -m src.main
