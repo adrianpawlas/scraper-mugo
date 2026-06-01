@@ -38,6 +38,17 @@ _DOWNLOAD_RETRIES = 3
 _DOWNLOAD_BACKOFF_SECONDS = 10
 
 
+def _embedding_tensor(outputs: torch.Tensor) -> torch.Tensor:
+    """Extract the pooled embedding tensor from a model output.
+
+    Newer transformers may return BaseModelOutputWithPooling instead of
+    a raw tensor from get_image_features / get_text_features.
+    """
+    if hasattr(outputs, 'pooler_output'):
+        return outputs.pooler_output
+    return outputs
+
+
 def _load_model() -> tuple[PreTrainedModel, ProcessorMixin]:
     """Load the SigLIP model and processor once (lazy singleton).
 
@@ -178,7 +189,7 @@ def get_image_embedding(image_url: str) -> Optional[list[float]]:
         with torch.no_grad():
             outputs = model.get_image_features(**inputs)
 
-        embedding = outputs.squeeze().tolist()
+        embedding = _embedding_tensor(outputs).squeeze().tolist()
         if isinstance(embedding, float):
             embedding = [embedding]
         # Sanity-check dimension
@@ -204,12 +215,22 @@ def get_text_embedding(text: str) -> Optional[list[float]]:
     try:
         model, processor = _load_model()
 
-        inputs = processor(text=[text], padding="max_length", return_tensors="pt")
+        # Read max sequence length from the model config dynamically
+        max_len = getattr(
+            model.config.text_config, "max_position_embeddings", 64
+        )
+        inputs = processor(
+            text=[text],
+            padding="max_length",
+            truncation=True,
+            max_length=max_len,
+            return_tensors="pt",
+        )
 
         with torch.no_grad():
             outputs = model.get_text_features(**inputs)
 
-        embedding = outputs.squeeze().tolist()
+        embedding = _embedding_tensor(outputs).squeeze().tolist()
         if isinstance(embedding, float):
             embedding = [embedding]
         if len(embedding) != EMBEDDING_DIM:
