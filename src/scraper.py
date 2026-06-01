@@ -1,7 +1,7 @@
 """Shopify product scraper for Mugo Department.
 
 Fetches all products from the Shopify JSON API, extracts fields,
-and generates embeddings.
+and generates embeddings only for new or changed products.
 """
 
 import json
@@ -18,7 +18,6 @@ from tqdm import tqdm
 from src.config import (
     BASE_URL,
     BRAND,
-    COLLECTION_URL,
     MAX_RETRIES,
     RATE_LIMIT_DELAY,
     SECOND_HAND,
@@ -40,6 +39,9 @@ _session.headers.update(
         "Accept": "application/json",
     }
 )
+
+# Embedding delay between API calls to avoid overwhelming the endpoint
+_EMBEDDING_DELAY = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -86,18 +88,10 @@ def _build_product_url(handle: str) -> str:
 def _extract_price_info(
     variants: list[dict],
 ) -> tuple[Optional[str], Optional[str]]:
-    """Extract price and sale from the first variant.
-
-    The Shopify JSON API returns the shop's default currency price.
-    Returns (price, sale) – sale is None when there is no discount.
-
-    Price formats: "20,90EUR , 450CZK , 75PLN" (comma+space separated).
-    When only the default currency is available, it is returned alone.
-    """
+    """Extract price and sale from the first variant."""
     if not variants:
         return None, None
 
-    # We look at the first (default) variant
     v = variants[0]
     raw_price = v.get("price")
     raw_compare = v.get("compare_at_price")
@@ -109,7 +103,6 @@ def _extract_price_info(
     if raw_price:
         price = f"{raw_price}{currency}"
 
-    # Shopify: compare_at_price > price means on sale
     if raw_compare and raw_price:
         try:
             cp = float(raw_compare.replace(",", "."))
@@ -120,7 +113,6 @@ def _extract_price_info(
         except (ValueError, AttributeError):
             pass
 
-    # Check all variants for multi-currency prices
     currencies_found: set[str] = set()
     all_prices: list[str] = []
     for var in variants:
@@ -132,11 +124,8 @@ def _extract_price_info(
                 currencies_found.add(key)
                 all_prices.append(key)
 
-    # Use all collected prices
     if len(all_prices) > 1:
         price = " , ".join(all_prices)
-        # For sale, we only report the first variant's sale info
-        # (multi-currency sale is complex)
         if sale:
             sale = f"{raw_price}{currency}"
 
@@ -157,21 +146,14 @@ def _extract_size(variants: list[dict], options: list[dict]) -> Optional[str]:
     return ", ".join(sorted(sizes)) if sizes else None
 
 
-def _extract_category(
-    product_type: str, tags: list[str]
-) -> Optional[str]:
-    """Build category from product type and relevant tags.
-
-    E.g. "Sweaters & Hoodies" -> "Sweaters, Hoodies".
-    """
+def _extract_category(product_type: str, tags: list[str]) -> Optional[str]:
+    """Build category from product type and relevant tags."""
     categories = []
 
     if product_type:
-        # Split on common delimiters
         parts = re.split(r"\s*[&,/]\s*", product_type)
         categories.extend(p.strip() for p in parts if p.strip())
 
-    # Also look for category-like tags (single word, capitalized)
     category_keywords = {
         "sweater", "hoodie", "tee", "t-shirt", "pants", "jacket",
         "coat", "shirt", "jeans", "shorts", "hat", "cap", "beanie",
@@ -211,6 +193,7 @@ def _build_metadata(
         "handle": product.get("handle"),
         "created_at_shopify": product.get("created_at"),
         "updated_at_shopify": product.get("updated_at"),
+        "missed_runs": 0,
     }
     return json.dumps(meta, ensure_ascii=False)
 
@@ -241,6 +224,48 @@ def _build_info_text(
     return "\n".join(p for p in parts if p)
 
 
+def _normalise_tags(tags_val: Any) -> Optional[str]:
+    """Normalize a tags value to a sorted comma-separated string for comparison.
+
+    Handles lists (jsonb), serialised JSON arrays, and raw strings.
+    """
+    if tags_val is None:
+        return None
+    if isinstance(tags_val, list):
+        return ", ".join(sorted(str(t).strip() for t in tags_val if str(t).strip()))
+    if isinstance(tags_val, str):
+        try:
+            parsed = json.loads(tags_val)
+            if isinstance(parsed, list):
+                return ", ".join(sorted(str(t).strip() for t in parsed if str(t).strip()))
+        except (json.JSONDecodeError, TypeError):
+            pass
+        # Fallback: treat as comma-separated string
+        parts = [t.strip() for t in tags_val.split(",") if t.strip()]
+        return ", ".join(sorted(parts)) if parts else None
+    return str(tags_val)
+
+
+def _compare_fields(
+    scraped: dict[str, Any],
+    existing: dict[str, Any],
+    fields: list[str],
+) -> bool:
+    """Check if any of the given fields differ between scraped and existing records.
+
+    Returns True if a change was detected.
+    """
+    for field in fields:
+        old = existing.get(field)
+        new = scraped.get(field)
+        # Normalize None and empty string to the same value
+        if not old and not new:
+            continue
+        if old != new:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Main scraper
 # ---------------------------------------------------------------------------
@@ -253,7 +278,6 @@ def fetch_all_product_handles() -> list[dict[str, Any]]:
     products_raw: list[dict[str, Any]] = []
     page = 1
 
-    # First, get the collection to know total count
     collection_json = _request(f"{BASE_URL}/collections/all.json")
     total_products = 0
     if collection_json:
@@ -281,10 +305,6 @@ def fetch_all_product_handles() -> list[dict[str, Any]]:
         page += 1
         time.sleep(RATE_LIMIT_DELAY)
 
-        # Keep paginating until the API returns an empty page
-        # Shopify may return fewer items than the requested limit
-        # (e.g. 60 instead of 250), so we cannot rely on the limit check.
-
     pbar.close()
     logger.info("Found %d products total", len(products_raw))
     return products_raw
@@ -299,19 +319,26 @@ def scrape_product_detail(handle: str) -> Optional[dict[str, Any]]:
     return None
 
 
-def process_product(product: dict[str, Any]) -> Optional[dict[str, Any]]:
+def process_product(
+    product: dict[str, Any],
+    existing_record: Optional[dict[str, Any]] = None,
+) -> tuple[Optional[dict[str, Any]], str]:
     """Process a single product dict into a database-ready record.
 
-    Downloads the main image, computes both image and text embeddings.
-    Returns the record ready for Supabase upsert, or None on critical failure.
+    Compares against existing_record (if provided) to determine if the
+    product is new, changed, or unchanged.  Embeddings are only generated
+    for new products or when the image URL changes.
+
+    Returns (record or None, action) where action is one of:
+        'new'      – product doesn't exist in DB yet
+        'updated'  – product changed (scraped data differs from existing)
+        'skipped'  – product unchanged, no action needed
     """
     handle = product.get("handle", "")
     title = product.get("title", "").strip()
     if not title:
         logger.warning("Skipping product with no title (handle=%s)", handle)
-        return None
-
-    logger.info("Processing: %s", title)
+        return None, "new"
 
     # --- Core fields ---
     product_type = product.get("product_type", "") or ""
@@ -332,7 +359,6 @@ def process_product(product: dict[str, Any]) -> Optional[dict[str, Any]]:
     # --- Main image ---
     image_url = None
     if images:
-        # Use the first image (position 1)
         image_url = images[0].get("src")
         if not image_url and "url" in images[0]:
             image_url = images[0]["url"]
@@ -353,26 +379,71 @@ def process_product(product: dict[str, Any]) -> Optional[dict[str, Any]]:
         if urls:
             additional_images = " , ".join(urls)
 
-    # --- Embeddings ---
+    # --- Build scraped comparison data ---
+    # Normalise tags to sorted comma-separated string for robust comparison
+    # regardless of how the DB stores them (jsonb list, TEXT, etc.)
+    normalised_tags = _normalise_tags(tags)
+    scraped_data = {
+        "title": title,
+        "price": price,
+        "sale": sale,
+        "description": description,
+        "image_url": image_url,
+        "additional_images": additional_images,
+        "size": size,
+        "category": category,
+        "tags": normalised_tags,
+    }
+
+    # --- Decide action based on comparison with existing record ---
+    action = "new"
+    changed_fields = [
+        "title", "price", "sale", "description",
+        "image_url", "additional_images", "size",
+        "category", "tags",
+    ]
+
+    if existing_record:
+        # Check if data changed
+        has_changes = _compare_fields(scraped_data, existing_record, changed_fields)
+        if not has_changes:
+            has_changes = existing_record.get("title") != title
+
+        if has_changes:
+            action = "updated"
+        else:
+            action = "skipped"
+
+    # --- Embeddings (only for new products or when image changes) ---
     image_embedding = None
     info_embedding = None
 
-    if image_url:
-        image_embedding = get_image_embedding(image_url)
-
-    info_text = _build_info_text(
-        title=title,
-        description=description,
-        category=category,
-        gender=None,  # Mugo products are unisex by default
-        price=price,
-        sale=sale,
-        size=size,
-        tags=tags,
-        brand=BRAND,
+    regenerate_embeddings = action == "new" or (
+        action == "updated" and image_url != existing_record.get("image_url")
     )
-    if info_text.strip():
-        info_embedding = get_text_embedding(info_text)
+
+    if regenerate_embeddings and image_url:
+        image_embedding = get_image_embedding(image_url)
+        time.sleep(_EMBEDDING_DELAY)
+
+        info_text = _build_info_text(
+            title=title,
+            description=description,
+            category=category,
+            gender=None,
+            price=price,
+            sale=sale,
+            size=size,
+            tags=tags,
+            brand=BRAND,
+        )
+        if info_text.strip():
+            info_embedding = get_text_embedding(info_text)
+            time.sleep(_EMBEDDING_DELAY)
+    elif action == "updated" and not regenerate_embeddings:
+        # Data changed but image is the same – carry over old embeddings
+        image_embedding = existing_record.get("image_embedding")
+        info_embedding = existing_record.get("info_embedding")
 
     # --- Metadata ---
     metadata = _build_metadata(
@@ -410,30 +481,74 @@ def process_product(product: dict[str, Any]) -> Optional[dict[str, Any]]:
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    return record
+    return record, action
 
 
-def run_scraper() -> list[dict[str, Any]]:
+# ---------------------------------------------------------------------------
+# Scraper entry point
+# ---------------------------------------------------------------------------
+
+ScraperResult = tuple[
+    list[dict[str, Any]],  # records to upsert (new + updated)
+    int,                   # new count
+    int,                   # updated count
+    int,                   # skipped count
+    set[str],              # seen product_urls
+]
+
+
+def run_scraper(
+    existing_map: Optional[dict[str, dict[str, Any]]] = None,
+) -> ScraperResult:
     """Run the full scraper pipeline.
 
-    Returns the list of successfully processed records.
+    Args:
+        existing_map: Dict of existing products keyed by product_url
+                      (from supabase_client.fetch_existing_products).
+
+    Returns:
+        (records_to_upsert, new_count, updated_count, skipped_count, seen_urls)
     """
+    if existing_map is None:
+        existing_map = {}
+
     products_raw = fetch_all_product_handles()
 
     if not products_raw:
         logger.warning("No products found to scrape!")
-        return []
+        return [], 0, 0, 0, set()
 
-    records: list[dict[str, Any]] = []
+    records_to_upsert: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    new_count = 0
+    updated_count = 0
+    skipped_count = 0
+
     for product in tqdm(products_raw, desc="Processing products", unit="product"):
-        record = process_product(product)
+        product_url = _build_product_url(product.get("handle", ""))
+        existing_record = existing_map.get(product_url)
+
+        record, action = process_product(product, existing_record)
+
         if record:
-            records.append(record)
+            seen_urls.add(record["product_url"])
+
+            if action == "skipped":
+                skipped_count += 1
+            else:
+                records_to_upsert.append(record)
+                if action == "new":
+                    new_count += 1
+                else:
+                    updated_count += 1
+
         time.sleep(RATE_LIMIT_DELAY)
 
     logger.info(
-        "Scraping complete: %d / %d products processed successfully",
-        len(records),
+        "Scraping complete: %d new, %d updated, %d skipped (of %d total)",
+        new_count,
+        updated_count,
+        skipped_count,
         len(products_raw),
     )
-    return records
+    return records_to_upsert, new_count, updated_count, skipped_count, seen_urls
