@@ -7,6 +7,7 @@ import io
 import logging
 import os
 import shutil
+import time
 from typing import Optional
 
 import requests
@@ -31,6 +32,10 @@ _processor: Optional[ProcessorMixin] = None
 
 # Once set to True, skip all further model load attempts (no model available)
 _load_failed: bool = False
+
+# Number of times to retry snapshot_download on failure
+_DOWNLOAD_RETRIES = 3
+_DOWNLOAD_BACKOFF_SECONDS = 10
 
 
 def _load_model() -> tuple[PreTrainedModel, ProcessorMixin]:
@@ -94,22 +99,41 @@ def _load_model() -> tuple[PreTrainedModel, ProcessorMixin]:
                 logger.info("Cleared cached model at %s", model_cache_path)
 
             # Attempt 2: explicitly download via snapshot_download first (more reliable)
-            try:
-                snapshot_download(
-                    EMBEDDING_MODEL,
-                    cache_dir=CACHE_DIR,
-                    resume_download=True,
-                    ignore_patterns=["*.h5", "*.ot", "*.msgpack"],
-                )
-                logger.info("Model downloaded via snapshot_download, loading...")
-            except Exception as sd_exc:
-                logger.error(
-                    "Failed to download model from HuggingFace Hub: %s", sd_exc
-                )
+            # Retry on transient failures (e.g. network issues, Xet storage glitches)
+            _download_success = False
+            for dl_attempt in range(1, _DOWNLOAD_RETRIES + 1):
+                try:
+                    snapshot_download(
+                        EMBEDDING_MODEL,
+                        cache_dir=CACHE_DIR,
+                        ignore_patterns=["*.h5", "*.ot", "*.msgpack"],
+                    )
+                    _download_success = True
+                    logger.info("Model downloaded via snapshot_download, loading...")
+                    break
+                except Exception as dl_exc:
+                    logger.warning(
+                        "snapshot_download failed (attempt %d/%d): %s",
+                        dl_attempt,
+                        _DOWNLOAD_RETRIES,
+                        dl_exc,
+                    )
+                    if dl_attempt < _DOWNLOAD_RETRIES:
+                        # Clear any partial cache before retrying
+                        if os.path.isdir(model_cache_path):
+                            shutil.rmtree(model_cache_path, ignore_errors=True)
+                        wait = _DOWNLOAD_BACKOFF_SECONDS * dl_attempt
+                        logger.info(
+                            "Retrying download in %d seconds...", wait
+                        )
+                        time.sleep(wait)
+
+            if not _download_success:
                 _load_failed = True
                 raise RuntimeError(
-                    f"Cannot download embedding model {EMBEDDING_MODEL}: {sd_exc}"
-                ) from sd_exc
+                    f"Cannot download embedding model {EMBEDDING_MODEL} "
+                    f"after {_DOWNLOAD_RETRIES} attempts"
+                )
 
             # Attempt 3: load after explicit download
             try:

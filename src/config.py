@@ -35,4 +35,5 @@ EMBEDDING_MODEL = os.getenv(
 EMBEDDING_DIM = 768
 
 # --- Paths ---
-CACHE_DIR = os.getenv("CACHE_DIR", "./.cache")
+# Expand tilde so os.path operations work correctly (os.path.isdir, shutil.rmtree, etc.)
+CACHE_DIR = os.path.expanduser(os.getenv("CACHE_DIR", "./.cache"))
