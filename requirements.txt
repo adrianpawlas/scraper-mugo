@@ -6,6 +6,8 @@ python-dotenv>=1.0.0
 torch>=2.0.0
 transformers>=4.40.0
 Pillow>=10.0.0
+sentencepiece>=0.2.0
+# Note: sentencepiece is required by SiglipTokenizer (google/siglip-base-patch16-384)
 
 # Supabase
 supabase>=2.0.0
